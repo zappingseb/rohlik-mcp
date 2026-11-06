@@ -18,6 +18,8 @@ export class RohlikAPI {
   private sessionCookies: string = '';
   private lastRequestTime: number = 0;
   private readonly minRequestInterval: number = 100; // Minimum 100ms between requests
+  private readonly maxRetries: number = 4;           // Retry attempts for HTTP 429/503
+  private readonly retryBaseDelay: number = 500;     // Base backoff in ms (doubles per attempt)
 
   constructor(credentials: RohlikCredentials) {
     this.credentials = credentials;
@@ -59,15 +61,32 @@ export class RohlikAPI {
       ...(options.headers as Record<string, string> || {})
     };
 
-    const response = await fetch(`${BASE_URL}${url}`, {
-      ...options,
-      headers
-    });
+    // The fixed 100ms throttle above spaces out sequential calls, but Knuspr
+    // still answers 429 (Too Many Requests) under load — e.g. when a single
+    // tool fans out many product/category lookups — and occasionally 503.
+    // Retry those with exponential backoff, honouring a Retry-After header.
+    let response!: Awaited<ReturnType<typeof fetch>>;
+    for (let attempt = 0; ; attempt++) {
+      response = await fetch(`${BASE_URL}${url}`, {
+        ...options,
+        headers
+      });
 
-    // Store cookies for session management
-    const setCookieHeader = response.headers.get('set-cookie');
-    if (setCookieHeader) {
-      this.sessionCookies = setCookieHeader;
+      // Store cookies for session management
+      const setCookieHeader = response.headers.get('set-cookie');
+      if (setCookieHeader) {
+        this.sessionCookies = setCookieHeader;
+      }
+
+      if ((response.status === 429 || response.status === 503) && attempt < this.maxRetries) {
+        const retryAfter = Number(response.headers.get('retry-after'));
+        const delay = Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : this.retryBaseDelay * 2 ** attempt;
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      break;
     }
 
     if (!response.ok) {
@@ -543,12 +562,46 @@ export class RohlikAPI {
     }
   }
 
-  async getOrderDetail(orderId: string): Promise<any> {
+  async getOrderDetail(orderId: string, includeCategories: boolean = true): Promise<any> {
     await this.login();
 
     try {
       const response = await this.makeRequest<any>(`/api/v3/orders/${orderId}`);
-      return response.data || response;
+      const order = response.data || response;
+
+      if (!includeCategories) return order;
+
+      // The order endpoint returns a product `id` per item but no category.
+      // Categories must be fetched per product (no batch endpoint exists), so
+      // we dedupe by id and let makeRequest's throttle + 429 backoff keep us
+      // under the rate limit. Failures degrade gracefully (no category).
+      const items: any[] = order.items || order.products || [];
+      const categoryCache = new Map<string, any[]>();
+
+      for (const item of items) {
+        const productId = item.id ?? item.productId;
+        if (productId == null) continue;
+        const key = String(productId);
+
+        if (!categoryCache.has(key)) {
+          try {
+            const catResp = await this.makeRequest<any>(`/api/v1/products/${key}/categories`) as any;
+            categoryCache.set(key, catResp?.categories || catResp?.data?.categories || []);
+          } catch {
+            categoryCache.set(key, []);
+          }
+        }
+
+        const categories = categoryCache.get(key) || [];
+        // level 0 = top-level department (e.g. "Süßes & Salziges").
+        const main = categories.find((c: any) => c.level === 0) || categories[0];
+        item.categories = categories;
+        item.mainCategory = main?.name || null;
+        item.mainCategoryId = main?.id ?? null;
+        item.categoryPath = categories.map((c: any) => c.name).join(' > ') || null;
+      }
+
+      return order;
     } finally {
       await this.logout();
     }

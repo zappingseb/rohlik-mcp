@@ -7,17 +7,18 @@ export function createOrderDetailTool(createRohlikAPI: () => RohlikAPI) {
     name: "get_order_detail",
     definition: {
       title: "Get Order Detail",
-      description: "Get detailed information about a specific order by its ID, including all products",
+      description: "Get detailed information about a specific order by its ID, including all products with quantity, price and category. Set includeCategories=false to skip per-product category lookups for a faster response.",
       inputSchema: {
-        orderId: z.string().describe("The order ID to fetch details for")
+        orderId: z.string().describe("The order ID to fetch details for"),
+        includeCategories: z.boolean().default(true).describe("Look up each product's category (default: true). Adds one request per unique product; set false for a faster, category-less response.")
       }
     },
-    handler: async (args: { orderId: string }) => {
-      const { orderId } = args;
-      
+    handler: async (args: { orderId: string; includeCategories?: boolean }) => {
+      const { orderId, includeCategories = true } = args;
+
       try {
         const api = createRohlikAPI();
-        const orderDetail = await api.getOrderDetail(orderId);
+        const orderDetail = await api.getOrderDetail(orderId, includeCategories);
 
         if (!orderDetail) {
           return {
@@ -37,10 +38,14 @@ export function createOrderDetailTool(createRohlikAPI: () => RohlikAPI) {
           const totalPrice = product.priceComposition?.total?.amount ?? 0;
           const unitPrice = product.priceComposition?.unit?.amount ?? 0;
           const productId = product.id || 'N/A';
+          const category = product.mainCategory ? `\n     Category: ${product.mainCategory}` : '';
+          const categoryPath = product.categoryPath && product.categoryPath !== product.mainCategory
+            ? `\n     Category path: ${product.categoryPath}`
+            : '';
 
           return `  ${index + 1}. [${productId}] ${name}
      Amount: ${amount}x (${textualAmount})
-     Price: ${totalPrice} ${getCurrency()} (unit: ${unitPrice} ${getCurrency()})`;
+     Price: ${totalPrice} ${getCurrency()} (unit: ${unitPrice} ${getCurrency()})${category}${categoryPath}`;
         };
 
         const order = orderDetail;
